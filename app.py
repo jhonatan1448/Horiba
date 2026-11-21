@@ -76,29 +76,101 @@ def normalizar_datos(df: pd.DataFrame) -> pd.DataFrame:
     return df.dropna(subset=["Fecha"]).reset_index(drop=True)
 
 
+# ------------------------------------------
+# ALMACENAMIENTO: Google Sheets (permanente) o CSV local (respaldo)
+# ------------------------------------------
+# Si en los "Secrets" de Streamlit existen [gcp_service_account] y spreadsheet = "...",
+# los datos se guardan en Google Sheets. Si no, se usan archivos CSV locales.
+HOJA_DATOS, HOJA_RANGOS = "datos", "rangos"
+
+
+def sheets_configurado() -> bool:
+    try:
+        return "gcp_service_account" in st.secrets and "spreadsheet" in st.secrets
+    except Exception:          # no existe secrets.toml
+        return False
+
+
+@st.cache_resource(show_spinner=False)
+def abrir_libro():
+    import gspread
+    cliente = gspread.service_account_from_dict(dict(st.secrets["gcp_service_account"]))
+    ref = str(st.secrets["spreadsheet"]).strip()
+    return cliente.open_by_url(ref) if ref.startswith("http") else cliente.open_by_key(ref)
+
+
+def obtener_hoja(nombre: str):
+    import gspread
+    libro = abrir_libro()
+    try:
+        return libro.worksheet(nombre)
+    except gspread.WorksheetNotFound:
+        return libro.add_worksheet(title=nombre, rows=1000, cols=20)
+
+
+@st.cache_data(ttl=600, show_spinner="Leyendo Google Sheets…")
+def leer_hoja(nombre: str) -> pd.DataFrame:
+    valores = obtener_hoja(nombre).get_all_values(value_render_option="UNFORMATTED_VALUE")
+    if not valores or not valores[0] or not any(valores[0]):
+        return pd.DataFrame()
+    return pd.DataFrame(valores[1:], columns=valores[0]).replace("", None)
+
+
+def escribir_hoja(nombre: str, df: pd.DataFrame) -> None:
+    df = df.copy()
+    for col in df.columns:
+        if pd.api.types.is_datetime64_any_dtype(df[col]):
+            df[col] = df[col].dt.strftime("%Y-%m-%d")
+    filas = df.astype(object).where(df.notna(), "").values.tolist()
+    hoja = obtener_hoja(nombre)
+    hoja.clear()
+    hoja.update(values=[list(df.columns)] + filas, range_name="A1", value_input_option="RAW")
+    leer_hoja.clear()
+
+
+USAR_SHEETS = sheets_configurado()
+ERROR_SHEETS = None
+if USAR_SHEETS:
+    try:
+        abrir_libro()
+    except Exception as e:  # credenciales o permisos incorrectos
+        USAR_SHEETS, ERROR_SHEETS = False, e
+
+
 def cargar_datos() -> pd.DataFrame:
-    if DB_FILE.exists():
-        return normalizar_datos(pd.read_csv(DB_FILE))
-    return normalizar_datos(pd.DataFrame(columns=COLUMNAS_DATOS))
+    if USAR_SHEETS:
+        df = leer_hoja(HOJA_DATOS)
+    else:
+        df = pd.read_csv(DB_FILE) if DB_FILE.exists() else pd.DataFrame()
+    return normalizar_datos(df if not df.empty else pd.DataFrame(columns=COLUMNAS_DATOS))
 
 
 def guardar_datos(df: pd.DataFrame) -> None:
-    normalizar_datos(df).to_csv(DB_FILE, index=False)
+    df = normalizar_datos(df)
+    if USAR_SHEETS:
+        escribir_hoja(HOJA_DATOS, df)
+    else:
+        df.to_csv(DB_FILE, index=False)
 
 
 def cargar_rangos() -> pd.DataFrame:
-    if RANGOS_FILE.exists():
-        df = pd.read_csv(RANGOS_FILE, dtype=str).fillna("-")
-        # Si el archivo guardado es de una versión anterior (sin columna de Sodio),
-        # se reemplaza por los nuevos valores por defecto.
-        if list(df.columns) == list(RANGOS_INICIALES.columns):
-            return df
-    RANGOS_INICIALES.to_csv(RANGOS_FILE, index=False)
+    if USAR_SHEETS:
+        df = leer_hoja(HOJA_RANGOS)
+    else:
+        df = pd.read_csv(RANGOS_FILE, dtype=str) if RANGOS_FILE.exists() else pd.DataFrame()
+    # Si no existe o es de una versión anterior (p. ej. sin columna de Sodio), se usan los valores por defecto.
+    if not df.empty and list(df.columns) == list(RANGOS_INICIALES.columns):
+        return df.astype(str).replace({"None": "-", "nan": "-"})
+    guardar_rangos(RANGOS_INICIALES)
     return RANGOS_INICIALES.copy()
 
 
 def guardar_rangos(df: pd.DataFrame) -> None:
-    df.fillna("-").to_csv(RANGOS_FILE, index=False)
+    df = df.fillna("-").astype(str)
+    if USAR_SHEETS:
+        escribir_hoja(HOJA_RANGOS, df)
+    else:
+        df.to_csv(RANGOS_FILE, index=False)
 
 
 def parsear_rango(texto) -> tuple:
@@ -410,6 +482,142 @@ def informe_texto(muestra: pd.Series, analisis: dict) -> str:
 
 
 # ==========================================
+# TABLERO DE LOTES
+# ==========================================
+def estado_simple(valor, mn, mx):
+    """'Bajo' / 'Óptimo' / 'Alto' / None."""
+    e = evaluar(valor, mn, mx)
+    for k in ("Bajo", "Óptimo", "Alto"):
+        if k in e:
+            return k
+    return None
+
+
+def resumen_lotes(df_hist: pd.DataFrame, df_rangos: pd.DataFrame, matriz: str, hoy=None) -> pd.DataFrame:
+    """Última muestra de cada lote para una matriz, con semáforo por parámetro."""
+    hoy = pd.Timestamp(hoy or date.today())
+    df = df_hist[df_hist["Matriz"] == matriz].sort_values("Fecha")
+    filas = []
+    for lote, grupo in df.groupby("Lote"):
+        m = grupo.iloc[-1]
+        fila = {"Lote": lote, "Fecha": m["Fecha"], "Días": int((hoy - m["Fecha"]).days), "Etapa": m["Etapa"]}
+        n_fuera = 0
+        for p in PARAMETROS:
+            mn, mx = buscar_rango(df_rangos, matriz, m["Etapa"], p)
+            e = evaluar(m[p], mn, mx)
+            if pd.isna(m[p]):
+                fila[NOMBRE_CORTO[p]] = "—"
+            else:
+                fila[NOMBRE_CORTO[p]] = f"{e[:1]} {m[p]:g}"
+                n_fuera += ("Alto" in e) or ("Bajo" in e)
+        fila["Fuera de rango"] = n_fuera
+        fila["Estado"] = "🟢 Bien" if n_fuera == 0 else ("🟠 Atención" if n_fuera <= 2 else "🔴 Corregir")
+        filas.append(fila)
+    if not filas:
+        return pd.DataFrame()
+    return pd.DataFrame(filas).sort_values(["Fuera de rango", "Días"], ascending=[False, False]).reset_index(drop=True)
+
+
+# ==========================================
+# RELACIÓN AGUA – SUELO – SAVIA
+# ==========================================
+CAUSAS_ABSORCION = {
+    "Ca_ppm": "riego irregular (el suelo se seca entre riegos), CE alta en el suelo, humedad relativa muy alta "
+              "(la planta transpira poco y el calcio no sube), exceso de potasio o amonio, o raíces dañadas",
+    "K_ppm": "exceso de calcio, magnesio o sodio que compiten con el potasio, suelo frío o encharcado, o raíces dañadas",
+    "NO3_ppm": "raíces dañadas o con poco oxígeno (encharcamiento), temperaturas bajas o exceso de cloruros",
+}
+
+
+def muestras_cercanas(df_hist: pd.DataFrame, lote: str, fecha_ref, ventana_dias: int) -> dict:
+    """Para cada matriz, la muestra del lote más cercana a la fecha de referencia (dentro de la ventana)."""
+    fecha_ref = pd.Timestamp(fecha_ref)
+    out = {}
+    for matriz in MATRICES:
+        d = df_hist[(df_hist["Lote"] == lote) & (df_hist["Matriz"] == matriz)].copy()
+        if d.empty:
+            continue
+        d["dist"] = (d["Fecha"] - fecha_ref).abs().dt.days
+        d = d[d["dist"] <= ventana_dias]
+        if not d.empty:
+            out[matriz] = d.sort_values(["dist", "Fecha"], ascending=[True, False]).iloc[0]
+    return out
+
+
+def indice_optimo(valor, mn, mx):
+    """100 = centro del rango óptimo (o el límite, si el rango es solo '< x' o '> x')."""
+    if valor is None or pd.isna(valor):
+        return None
+    ref = (mn + mx) / 2 if (mn is not None and mx is not None) else (mx if mx is not None else mn)
+    return round(100 * valor / ref, 1) if ref else None
+
+
+def interpretar_relacion(muestras: dict, df_rangos: pd.DataFrame) -> list:
+    """Reglas que cruzan agua, suelo y savia para indicar de dónde viene el problema."""
+    def est(matriz, p):
+        m = muestras.get(matriz)
+        if m is None or pd.isna(m[p]):
+            return None
+        return estado_simple(m[p], *buscar_rango(df_rangos, matriz, m["Etapa"], p))
+
+    out = []
+    for p in ["Ca_ppm", "K_ppm", "NO3_ppm"]:
+        nombre = NOMBRE_CORTO[p]
+        s, v = est("Solución de Suelo", p), est("Savia (ECP)", p)
+        if s in ("Óptimo", "Alto") and v == "Bajo":
+            out.append(("error", f"{nombre}: hay en el suelo, pero no llega a la planta",
+                        f"El problema no es la cantidad aplicada sino la absorción. Causas comunes: {CAUSAS_ABSORCION[p]}. "
+                        f"Aplicar más {nombre.lower()} al suelo probablemente no lo resuelva; corrige primero la causa."))
+        elif s == "Bajo" and v == "Bajo":
+            out.append(("error", f"{nombre}: falta en el suelo y en la planta",
+                        f"Es un problema de aporte. Aumenta el {nombre.lower()} en la fertirrigación."))
+        elif s == "Bajo" and v in ("Óptimo", "Alto"):
+            out.append(("warning", f"{nombre}: la planta está bien, pero el suelo se está agotando",
+                        f"Ajusta el aporte de {nombre.lower()} ahora, antes de que la deficiencia aparezca en la planta."))
+        elif s == "Alto" and v == "Alto":
+            out.append(("warning", f"{nombre}: exceso en el suelo y en la planta",
+                        f"Se está sobrefertilizando con {nombre.lower()}. Reduce la dosis; ahorras fertilizante."))
+        elif s == "Óptimo" and v == "Alto":
+            out.append(("info", f"{nombre}: la planta está acumulando",
+                        f"El suelo está bien pero la planta tiene de más. Vigila y considera bajar un poco el aporte."))
+        elif s == "Óptimo" and v == "Óptimo":
+            out.append(("success", f"{nombre}: suelo y planta en equilibrio", "Mantén el manejo actual."))
+
+    a_na, s_na, v_na = est("Agua de Riego", "Na_ppm"), est("Solución de Suelo", "Na_ppm"), est("Savia (ECP)", "Na_ppm")
+    if a_na == "Alto":
+        txt = "El agua de riego es una fuente de sodio."
+        if s_na == "Alto":
+            txt += " Ya se está acumulando en el suelo."
+        if v_na == "Alto":
+            txt += " Y está llegando a la planta (estrés salino)."
+        out.append(("error", "Sodio: viene del agua de riego",
+                    txt + " Considera mezclar o cambiar la fuente de agua, riegos de lavado y aporte de calcio."))
+    elif s_na == "Alto":
+        out.append(("warning", "Sodio: se acumula en el suelo sin venir del agua",
+                    "Revisa fertilizantes o enmiendas que contengan sodio y el drenaje del suelo."))
+
+    if est("Agua de Riego", "EC_dS_m") == "Alto" and est("Solución de Suelo", "EC_dS_m") == "Alto":
+        out.append(("warning", "Sales: el agua está salinizando el suelo",
+                    "Aumenta la fracción de lavado (que drene un 15–25 % del riego) y descuenta las sales del agua."))
+    if est("Agua de Riego", "pH") == "Alto" and est("Solución de Suelo", "pH") == "Alto":
+        out.append(("warning", "pH: el agua alcalina está subiendo el pH del suelo",
+                    "Acidifica el agua de riego; mejorará la disponibilidad de hierro, fósforo y micronutrientes."))
+    return out
+
+
+def aporte_agua(muestras: dict) -> list:
+    """Cuánto representa lo que trae el agua frente a lo que hay en la solución de suelo."""
+    a, s = muestras.get("Agua de Riego"), muestras.get("Solución de Suelo")
+    if a is None or s is None:
+        return []
+    out = []
+    for p in ["Ca_ppm", "K_ppm", "NO3_ppm", "Na_ppm"]:
+        if pd.notna(a[p]) and pd.notna(s[p]) and s[p] > 0:
+            out.append((NOMBRE_CORTO[p], a[p], s[p], 100 * a[p] / s[p]))
+    return out
+
+
+# ==========================================
 # ESTADO
 # ==========================================
 df_historico = cargar_datos()
@@ -460,9 +668,18 @@ def mostrar_analisis(muestra: pd.Series, clave: str) -> None:
 # BARRA LATERAL: respaldo de datos
 # ==========================================
 with st.sidebar:
-    st.header("💾 Respaldo de datos")
-    st.caption("En Streamlit Cloud los archivos se borran cuando la app se reinicia. "
-               "Descarga un respaldo después de cada jornada y súbelo si la app se reinicia.")
+    st.header("💾 Datos")
+    if USAR_SHEETS:
+        st.success("☁️ Guardando en Google Sheets (permanente)")
+        if st.button("🔄 Recargar datos de la hoja", width="stretch"):
+            leer_hoja.clear()
+            st.rerun()
+    elif ERROR_SHEETS is not None:
+        st.error(f"No se pudo conectar a Google Sheets: {ERROR_SHEETS}. "
+                 "Se están usando archivos temporales: descarga un respaldo antes de cerrar.")
+    else:
+        st.warning("📁 Guardando en archivos temporales. En Streamlit Cloud se borran al reiniciarse la app: "
+                   "descarga un respaldo cada jornada o configura Google Sheets (ver README).")
     st.download_button("📥 Descargar respaldo (CSV)",
                        data=df_historico.to_csv(index=False).encode("utf-8"),
                        file_name=f"respaldo_horiba_{date.today():%Y%m%d}.csv",
@@ -494,8 +711,128 @@ with st.sidebar:
 st.title("🌱 Sistema de Análisis y Registro - HORIBA LAQUAtwin")
 st.write("Registra y analiza los parámetros químicos de Agua, Suelo y Savia por etapas fenológicas.")
 
-tab_ingreso, tab_analisis, tab_graf, tab_hist, tab_rangos = st.tabs(
-    ["📥 Nuevo ingreso", "🧠 Análisis", "📊 Gráficos de tendencia", "📋 Histórico", "🔬 Rangos de referencia"])
+tab_ingreso, tab_tablero, tab_analisis, tab_relacion, tab_graf, tab_hist, tab_rangos = st.tabs(
+    ["📥 Nuevo ingreso", "🏠 Tablero de lotes", "🧠 Análisis", "🔗 Agua–Suelo–Savia",
+     "📊 Gráficos de tendencia", "📋 Histórico", "🔬 Rangos de referencia"])
+
+COLORES_MATRIZ = {"Agua de Riego": "#4C78A8", "Solución de Suelo": "#9D755D", "Savia (ECP)": "#54A24B"}
+
+# ==========================================
+# PESTAÑA: TABLERO DE LOTES
+# ==========================================
+with tab_tablero:
+    st.header("🏠 Tablero de lotes")
+    st.caption("Último muestreo de cada lote. Los lotes con más problemas aparecen primero.")
+    if df_historico.empty:
+        st.info("Aún no hay muestras registradas.")
+    else:
+        disponibles = [m for m in MATRICES if m in df_historico["Matriz"].unique()]
+        matriz_t = st.radio("Matriz", disponibles, horizontal=True, key="matriz_tablero",
+                            index=disponibles.index("Savia (ECP)") if "Savia (ECP)" in disponibles else 0)
+        dias_alerta = 14
+        res = resumen_lotes(df_historico, df_rangos, matriz_t)
+
+        k1, k2, k3, k4, k5 = st.columns(5)
+        k1.metric("Lotes", len(res))
+        k2.metric("🟢 Bien", int((res["Estado"] == "🟢 Bien").sum()))
+        k3.metric("🟠 Atención", int((res["Estado"] == "🟠 Atención").sum()))
+        k4.metric("🔴 Corregir", int((res["Estado"] == "🔴 Corregir").sum()))
+        k5.metric(f"⏰ Sin medir +{dias_alerta} días", int((res["Días"] > dias_alerta).sum()))
+
+        columnas = st.columns(3)
+        for i, fila in res.iterrows():
+            with columnas[i % 3].container(border=True):
+                st.markdown(f"### {fila['Lote']}")
+                st.markdown(f"**{fila['Estado']}** · {fila['Fuera de rango']} fuera de rango")
+                hace = "hoy" if fila["Días"] == 0 else f"hace {fila['Días']} días"
+                st.caption(f"📅 {fila['Fecha']:%d/%m/%Y} ({hace}) · {fila['Etapa']}")
+                if fila["Días"] > dias_alerta:
+                    st.caption(f"⏰ Toca volver a medir este lote")
+                st.markdown("  \n".join(f"{fila[NOMBRE_CORTO[p]]} · {NOMBRE_CORTO[p]}"
+                                        for p in PARAMETROS if fila[NOMBRE_CORTO[p]] != "—"))
+
+        with st.expander("Ver como tabla"):
+            st.dataframe(res, hide_index=True, width="stretch",
+                         column_config={"Fecha": st.column_config.DateColumn(format="DD/MM/YYYY")})
+        st.caption("🟢 óptimo · 🔵 bajo · 🔴 alto · ⚪ sin rango. Para ver qué hacer en cada lote, "
+                   "usa la pestaña 🧠 Análisis.")
+
+# ==========================================
+# PESTAÑA: RELACIÓN AGUA – SUELO – SAVIA
+# ==========================================
+with tab_relacion:
+    st.header("🔗 Relación Agua – Suelo – Savia")
+    st.caption("Compara las tres matrices del mismo lote para saber si un problema viene del agua, "
+               "del suelo o de la absorción de la planta.")
+    if df_historico.empty:
+        st.info("Aún no hay muestras registradas.")
+    else:
+        r1, r2, r3 = st.columns(3)
+        lote_r = r1.selectbox("Lote", sorted(df_historico["Lote"].unique()), key="lote_rel")
+        fecha_max = df_historico.loc[df_historico["Lote"] == lote_r, "Fecha"].max().date()
+        fecha_r = r2.date_input("Fecha de referencia", fecha_max, format="DD/MM/YYYY", key="fecha_rel")
+        ventana = r3.slider("Buscar muestras ± días", 0, 30, 7, key="ventana_rel",
+                            help="Las muestras de agua, suelo y savia no siempre se toman el mismo día.")
+
+        muestras = muestras_cercanas(df_historico, lote_r, fecha_r, ventana)
+        faltan = [m for m in MATRICES if m not in muestras]
+
+        if not muestras:
+            st.warning("No hay muestras de este lote cerca de esa fecha. Amplía la ventana de días.")
+        else:
+            st.markdown("**Muestras usadas:** " + " · ".join(
+                f"{m}: {muestras[m]['Fecha']:%d/%m/%Y}" for m in MATRICES if m in muestras))
+            if faltan:
+                st.info("Falta: " + ", ".join(faltan) + ". El análisis cruzado es más completo con las tres matrices.")
+
+            # Tabla comparativa
+            tabla, barras = [], []
+            for p in PARAMETROS:
+                fila = {"Parámetro": PARAMETROS[p][1]}
+                for m in MATRICES:
+                    if m in muestras and pd.notna(muestras[m][p]):
+                        mn, mx = buscar_rango(df_rangos, m, muestras[m]["Etapa"], p)
+                        fila[m] = f"{evaluar(muestras[m][p], mn, mx)[:1]} {muestras[m][p]:g}"
+                        idx = indice_optimo(muestras[m][p], mn, mx)
+                        if idx is not None:
+                            barras.append({"Parámetro": NOMBRE_CORTO[p], "Matriz": m, "Índice": idx,
+                                           "Valor": muestras[m][p]})
+                    else:
+                        fila[m] = "—"
+                tabla.append(fila)
+            st.dataframe(pd.DataFrame(tabla), hide_index=True, width="stretch")
+
+            if barras:
+                fig_r = px.bar(pd.DataFrame(barras), x="Parámetro", y="Índice", color="Matriz", barmode="group",
+                               color_discrete_map=COLORES_MATRIZ, hover_data={"Valor": True},
+                               labels={"Índice": "% respecto al óptimo"},
+                               title="¿Qué tan cerca del óptimo está cada matriz? (100 = centro del rango)")
+                fig_r.add_hline(y=100, line_dash="dash", line_color="green",
+                                annotation_text="Óptimo", annotation_position="top left")
+                st.plotly_chart(fig_r, width="stretch")
+                st.caption("Cada matriz se compara con su propio rango, porque las concentraciones en savia son "
+                           "mucho mayores que en el agua o el suelo. Para Sodio y CE del agua, 100 = límite máximo.")
+
+            st.subheader("🧠 Interpretación")
+            hallazgos_r = interpretar_relacion(muestras, df_rangos)
+            if not hallazgos_r:
+                st.info("Se necesitan al menos suelo y savia (o agua y suelo) con datos para cruzar la información.")
+            iconos_r = {"error": "🔴", "warning": "🟠", "info": "🔵", "success": "🟢"}
+            for nivel, titulo, texto in hallazgos_r:
+                with st.container(border=True):
+                    st.markdown(f"**{iconos_r[nivel]} {titulo}**")
+                    st.markdown(texto)
+
+            aporte = aporte_agua(muestras)
+            if aporte:
+                st.subheader("💧 Lo que aporta el agua de riego")
+                cols = st.columns(len(aporte))
+                for col, (nombre, a, s, pct) in zip(cols, aporte):
+                    col.metric(nombre, f"{a:g} ppm", help=f"Solución de suelo: {s:g} ppm")
+                    col.caption(f"= {pct:.0f} % de lo que hay en el suelo")
+                st.caption("Si el agua aporta una parte importante (más del 20–30 %) de un nutriente, descuéntalo "
+                           "del plan de fertilización. Si se trata de sodio, es una alerta de calidad de agua.")
+            st.caption("ℹ️ Análisis orientativo. Confirma las decisiones con tu agrónomo.")
 
 # ==========================================
 # PESTAÑA 1: INGRESO DE DATOS
