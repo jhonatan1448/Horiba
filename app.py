@@ -86,15 +86,20 @@ HOJA_DATOS, HOJA_RANGOS = "datos", "rangos"
 
 def sheets_configurado() -> bool:
     try:
-        return "gcp_service_account" in st.secrets and "spreadsheet" in st.secrets
+        return ("gcp_json" in st.secrets or "gcp_service_account" in st.secrets) and "spreadsheet" in st.secrets
     except Exception:          # no existe secrets.toml
         return False
 
 
 @st.cache_resource(show_spinner=False)
 def abrir_libro():
+    import json
     import gspread
-    cliente = gspread.service_account_from_dict(dict(st.secrets["gcp_service_account"]))
+    if "gcp_json" in st.secrets:        # forma fácil: el JSON de Google pegado completo
+        credenciales = json.loads(st.secrets["gcp_json"])
+    else:                               # forma clásica: campo por campo en [gcp_service_account]
+        credenciales = dict(st.secrets["gcp_service_account"])
+    cliente = gspread.service_account_from_dict(credenciales)
     ref = str(st.secrets["spreadsheet"]).strip()
     return cliente.open_by_url(ref) if ref.startswith("http") else cliente.open_by_key(ref)
 
