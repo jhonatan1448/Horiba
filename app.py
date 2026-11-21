@@ -133,13 +133,50 @@ def escribir_hoja(nombre: str, df: pd.DataFrame) -> None:
     leer_hoja.clear()
 
 
+def correo_robot() -> str:
+    """client_email de la cuenta de servicio (para indicar con quién compartir la hoja)."""
+    import json
+    try:
+        if "gcp_json" in st.secrets:
+            return json.loads(st.secrets["gcp_json"]).get("client_email", "")
+        return st.secrets["gcp_service_account"].get("client_email", "")
+    except Exception:
+        return ""
+
+
+def explicar_error(e: Exception) -> str:
+    """Traduce los errores de Google a instrucciones claras."""
+    import json
+    nombre = type(e).__name__
+    detalle = str(e).strip()
+    correo = correo_robot()
+    compartir = (f"Abre tu hoja de Google → **Compartir** → agrega **{correo}** como **Editor**."
+                 if correo else "Comparte la hoja con el `client_email` del archivo JSON como **Editor**.")
+    if isinstance(e, json.JSONDecodeError):
+        return ("El contenido pegado en `gcp_json` no es un JSON válido. Vuelve a copiar TODO el archivo .json "
+                "(desde la `{` hasta la `}`) y pégalo entre las `'''`.")
+    if nombre == "NoValidUrlKeyFound":
+        return "El enlace de `spreadsheet` no es válido. Copia la dirección completa de tu hoja de Google."
+    if nombre in ("SpreadsheetNotFound", "PermissionError") or "404" in detalle or "403" in detalle:
+        txt = f"Google no encuentra la hoja o no da permiso. {compartir} Revisa también que el enlace sea el correcto."
+        if "has not been used" in detalle or "is disabled" in detalle or "SERVICE_DISABLED" in detalle:
+            txt = ("Falta habilitar una API en Google Cloud: entra a **APIs y servicios → Biblioteca** "
+                   "y habilita **Google Sheets API** y **Google Drive API**. Espera 2 minutos y recarga.")
+        return txt
+    if "invalid_grant" in detalle or "private key" in detalle.lower() or "Could not deserialize" in detalle:
+        return ("La clave privada del JSON está dañada o incompleta. Vuelve a pegar el JSON completo, "
+                "o crea una clave nueva en Google Cloud.")
+    return f"{nombre}: {detalle or 'sin detalle'}"
+
+
 USAR_SHEETS = sheets_configurado()
 ERROR_SHEETS = None
 if USAR_SHEETS:
     try:
         abrir_libro()
     except Exception as e:  # credenciales o permisos incorrectos
-        USAR_SHEETS, ERROR_SHEETS = False, e
+        abrir_libro.clear()   # para que vuelva a intentar en la próxima recarga
+        USAR_SHEETS, ERROR_SHEETS = False, explicar_error(e)
 
 
 def cargar_datos() -> pd.DataFrame:
@@ -680,8 +717,11 @@ with st.sidebar:
             leer_hoja.clear()
             st.rerun()
     elif ERROR_SHEETS is not None:
-        st.error(f"No se pudo conectar a Google Sheets: {ERROR_SHEETS}. "
-                 "Se están usando archivos temporales: descarga un respaldo antes de cerrar.")
+        st.error(f"**No se pudo conectar a Google Sheets.**\n\n{ERROR_SHEETS}\n\n"
+                 "Mientras tanto se usan archivos temporales: descarga un respaldo antes de cerrar.")
+        if st.button("🔄 Reintentar conexión", width="stretch"):
+            abrir_libro.clear()
+            st.rerun()
     else:
         st.warning("📁 Guardando en archivos temporales. En Streamlit Cloud se borran al reiniciarse la app: "
                    "descarga un respaldo cada jornada o configura Google Sheets (ver README).")
