@@ -1,0 +1,9 @@
+# Datos de campo: no se suben al repositorio público
+datos_horiba_tomate.csv
+rangos_referencia.csv
+respaldo_horiba_*.csv
+reporte_horiba*.xlsx
+
+__pycache__/
+.venv/
+.streamlit/secrets.toml
