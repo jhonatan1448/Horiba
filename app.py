@@ -660,6 +660,93 @@ def aporte_agua(muestras: dict) -> list:
 
 
 # ==========================================
+# EVOLUCIÓN EN EL TIEMPO (¿mejoró o empeoró?)
+# ==========================================
+def desvio_optimo(valor, mn, mx):
+    """0 = dentro del óptimo. >0 = fracción por fuera del límite más cercano (0.2 = 20 % fuera)."""
+    if valor is None or pd.isna(valor) or (mn is None and mx is None):
+        return None
+    if mn is not None and valor < mn:
+        return (mn - valor) / mn if mn else 0
+    if mx is not None and valor > mx:
+        return (valor - mx) / mx if mx else 0
+    return 0.0
+
+
+def posicion_en_rango(valor, mn, mx):
+    """Ubica el valor dentro del rango de SU etapa: 0 % = mínimo, 100 % = máximo (franja verde)."""
+    if valor is None or pd.isna(valor) or (mn is None and mx is None):
+        return None
+    if mn is not None and mx is not None and mx > mn:
+        return round(100 * (valor - mn) / (mx - mn), 1)
+    if mx is not None:                      # rango tipo '< x'
+        return round(100 * valor / mx, 1) if mx else None
+    return round(100 * (1 + (valor - mn) / mn), 1) if mn else None   # rango tipo '> x'
+
+
+def texto_rango(mn, mx) -> str:
+    if mn is None and mx is None:
+        return "sin rango"
+    if mn is None:
+        return f"< {mx:g}"
+    if mx is None:
+        return f"> {mn:g}"
+    return f"{mn:g} - {mx:g}"
+
+
+def comparar_muestras(m0: pd.Series, m1: pd.Series, df_rangos: pd.DataFrame) -> pd.DataFrame:
+    """Compara dos muestras (aunque sean de etapas distintas) según la cercanía al óptimo de cada etapa."""
+    filas = []
+    for p in PARAMETROS:
+        a, b = m0[p], m1[p]
+        if pd.isna(a) or pd.isna(b):
+            continue
+        r0 = buscar_rango(df_rangos, m0["Matriz"], m0["Etapa"], p)
+        r1 = buscar_rango(df_rangos, m1["Matriz"], m1["Etapa"], p)
+        d0, d1 = desvio_optimo(a, *r0), desvio_optimo(b, *r1)
+        e0, e1 = evaluar(a, *r0), evaluar(b, *r1)
+        if d0 is None or d1 is None:
+            veredicto, orden = "⚪ Sin rango para comparar", 5
+        elif d0 == 0 and d1 == 0:
+            veredicto, orden = "➖ Se mantuvo en el óptimo", 3
+        elif d1 == 0:
+            veredicto, orden = "✅ Mejoró: entró al óptimo", 1
+        elif d0 == 0:
+            veredicto, orden = "❌ Empeoró: salió del óptimo", 0
+        elif d1 < d0 - 0.02:
+            veredicto, orden = "✅ Mejoró: más cerca del óptimo", 2
+        elif d1 > d0 + 0.02:
+            veredicto, orden = "❌ Empeoró: más lejos del óptimo", 0
+        else:
+            veredicto, orden = "⚠️ Sigue fuera de rango, casi igual", 4
+
+        nombre = NOMBRE_CORTO[p]
+        explicacion = (f"Pasó de {a:g} a {b:g} ({(b - a) / a:+.0%})." if a else f"Pasó de {a:g} a {b:g}.")
+        explicacion += f" Antes: {e0[2:].lower()} (ideal {texto_rango(*r0)})."
+        explicacion += f" Ahora: {e1[2:].lower()} (ideal {texto_rango(*r1)})."
+        if r0 != r1 and d0 is not None and d1 is not None:
+            # Aclarar cuando el cambio de etapa explica el resultado
+            sube = b > a
+            if (sube and "Mejoró" in veredicto and "Alto" in e0) or (not sube and "Mejoró" in veredicto and "Bajo" in e0):
+                explicacion += " Mejoró porque en la nueva etapa la planta necesita otra cantidad."
+            elif (sube and "Empeoró" in veredicto and "Bajo" in e1) or (not sube and "Empeoró" in veredicto and "Alto" in e1):
+                explicacion += " El valor cambió, pero la nueva etapa exige otra cantidad: ajusta la fertilización a la etapa."
+        filas.append({"Parámetro": nombre, "Antes": a, "Estado antes": e0, "Ahora": b, "Estado ahora": e1,
+                      "Resultado": veredicto, "Explicación": explicacion, "_orden": orden})
+    if not filas:
+        return pd.DataFrame()
+    return pd.DataFrame(filas).sort_values("_orden").drop(columns="_orden").reset_index(drop=True)
+
+
+def porcentaje_optimo(m: pd.Series, df_rangos: pd.DataFrame):
+    """% de parámetros medidos (con rango) que están en el óptimo."""
+    estados = [evaluar(m[p], *buscar_rango(df_rangos, m["Matriz"], m["Etapa"], p))
+               for p in PARAMETROS if pd.notna(m[p])]
+    con_rango = [e for e in estados if "Sin rango" not in e]
+    return None if not con_rango else 100 * sum("Óptimo" in e for e in con_rango) / len(con_rango)
+
+
+# ==========================================
 # ESTADO
 # ==========================================
 df_historico = cargar_datos()
@@ -756,9 +843,129 @@ with st.sidebar:
 st.title("🌱 Sistema de Análisis y Registro - HORIBA LAQUAtwin")
 st.write("Registra y analiza los parámetros químicos de Agua, Suelo y Savia por etapas fenológicas.")
 
-tab_ingreso, tab_tablero, tab_analisis, tab_relacion, tab_graf, tab_hist, tab_rangos = st.tabs(
-    ["📥 Nuevo ingreso", "🏠 Tablero de lotes", "🧠 Análisis", "🔗 Agua–Suelo–Savia",
+tab_ingreso, tab_tablero, tab_analisis, tab_evolucion, tab_relacion, tab_graf, tab_hist, tab_rangos = st.tabs(
+    ["📥 Nuevo ingreso", "🏠 Tablero de lotes", "🧠 Análisis", "⏳ Evolución", "🔗 Agua–Suelo–Savia",
      "📊 Gráficos de tendencia", "📋 Histórico", "🔬 Rangos de referencia"])
+
+# ==========================================
+# PESTAÑA: EVOLUCIÓN EN EL TIEMPO
+# ==========================================
+with tab_evolucion:
+    st.header("⏳ Evolución en el tiempo: ¿mejoró o empeoró la planta?")
+    st.caption("Cada muestra se compara con el óptimo de SU propia etapa. Así, aunque los rangos cambien "
+               "de una etapa a otra, sabes si la planta va mejor o peor.")
+    if df_historico.empty:
+        st.info("Aún no hay muestras registradas.")
+    else:
+        e1c, e2c = st.columns(2)
+        lote_e = e1c.selectbox("Lote", sorted(df_historico["Lote"].unique()), key="lote_evo")
+        df_le = df_historico[df_historico["Lote"] == lote_e]
+        mats = [m for m in MATRICES if m in df_le["Matriz"].unique()]
+        matriz_e = e2c.selectbox("Matriz", mats, key="matriz_evo",
+                                 index=mats.index("Savia (ECP)") if "Savia (ECP)" in mats else 0)
+        serie = df_le[df_le["Matriz"] == matriz_e].sort_values("Fecha")
+
+        if len(serie) < 2:
+            st.info(f"Este lote tiene {len(serie)} muestra de {matriz_e}. Se necesitan al menos 2 para comparar.")
+        else:
+            etiqueta = lambda i: f"{serie.loc[i, 'Fecha']:%d/%m/%Y} · {serie.loc[i, 'Etapa']}"
+            s1, s2 = st.columns(2)
+            i0 = s1.selectbox("📍 Muestra inicial (antes)", serie.index, index=0, format_func=etiqueta, key="evo_i0")
+            i1 = s2.selectbox("🏁 Muestra final (ahora)", serie.index, index=len(serie) - 1,
+                              format_func=etiqueta, key="evo_i1")
+            m0, m1 = serie.loc[i0], serie.loc[i1]
+            if m0["Fecha"] > m1["Fecha"]:
+                m0, m1 = m1, m0
+                st.caption("ℹ️ Invertí el orden para que 'antes' sea la muestra más antigua.")
+
+            comp = comparar_muestras(m0, m1, df_rangos)
+            if i0 == i1:
+                st.warning("Elige dos muestras diferentes.")
+            elif comp.empty:
+                st.warning("Las dos muestras no tienen parámetros en común para comparar.")
+            else:
+                # ----- Resumen general -----
+                p0, p1 = porcentaje_optimo(m0, df_rangos), porcentaje_optimo(m1, df_rangos)
+                n_mej = comp["Resultado"].str.startswith("✅").sum()
+                n_emp = comp["Resultado"].str.startswith("❌").sum()
+                n_igual = len(comp) - n_mej - n_emp
+                dias = (m1["Fecha"] - m0["Fecha"]).days
+
+                if n_mej > n_emp:
+                    st.success(f"📈 **En general la planta MEJORÓ** en {dias} días: "
+                               f"{n_mej} parámetro(s) mejoraron y {n_emp} empeoraron.")
+                elif n_emp > n_mej:
+                    st.error(f"📉 **En general la planta EMPEORÓ** en {dias} días: "
+                             f"{n_emp} parámetro(s) empeoraron y {n_mej} mejoraron.")
+                else:
+                    st.warning(f"↔️ **La planta se mantiene parecida** en {dias} días: "
+                               f"{n_mej} mejoraron, {n_emp} empeoraron.")
+
+                c1, c2, c3, c4 = st.columns(4)
+                if p0 is not None and p1 is not None:
+                    c1.metric("Parámetros en óptimo", f"{p1:.0f} %", delta=f"{p1 - p0:+.0f} puntos",
+                              help=f"Antes: {p0:.0f} %")
+                c2.metric("✅ Mejoraron", int(n_mej))
+                c3.metric("❌ Empeoraron", int(n_emp))
+                c4.metric("➖ / ⚠️ Sin cambio", int(n_igual))
+                st.caption(f"Antes: {m0['Fecha']:%d/%m/%Y} ({m0['Etapa']}) → "
+                           f"Ahora: {m1['Fecha']:%d/%m/%Y} ({m1['Etapa']})")
+
+                # ----- Tabla comparativa -----
+                st.dataframe(comp.drop(columns="Explicación"), hide_index=True, width="stretch",
+                             column_config={"Antes": st.column_config.NumberColumn(format="%g"),
+                                            "Ahora": st.column_config.NumberColumn(format="%g")})
+
+                # ----- Explicación en palabras -----
+                st.subheader("📝 Qué pasó con cada parámetro")
+                for fila in comp.itertuples():
+                    icono, texto_res = fila.Resultado.split(" ", 1)
+                    st.markdown(f"**{icono} {fila.Parámetro}** — {texto_res}. {fila.Explicación}")
+
+                # ----- Gráfico: posición dentro del rango de cada etapa -----
+                st.subheader("📊 Recorrido dentro del rango óptimo")
+                params_graf = st.multiselect(
+                    "Parámetros a graficar", [NOMBRE_CORTO[p] for p in PARAMETROS],
+                    default=[n for n in ["Nitrato", "Potasio", "Calcio"] if n in comp["Parámetro"].values],
+                    key="evo_params")
+                tramo = serie[(serie["Fecha"] >= m0["Fecha"]) & (serie["Fecha"] <= m1["Fecha"])]
+                puntos = []
+                for _, m in tramo.iterrows():
+                    for p in PARAMETROS:
+                        if NOMBRE_CORTO[p] not in params_graf or pd.isna(m[p]):
+                            continue
+                        mn, mx = buscar_rango(df_rangos, m["Matriz"], m["Etapa"], p)
+                        pos = posicion_en_rango(m[p], mn, mx)
+                        if pos is not None:
+                            puntos.append({"Fecha": m["Fecha"], "Parámetro": NOMBRE_CORTO[p], "Posición": pos,
+                                           "Valor": m[p], "Etapa": m["Etapa"], "Óptimo": texto_rango(mn, mx)})
+                if puntos:
+                    df_p = pd.DataFrame(puntos)
+                    fig_e = px.line(df_p, x="Fecha", y="Posición", color="Parámetro", markers=True,
+                                    hover_data={"Valor": True, "Etapa": True, "Óptimo": True, "Posición": ":.0f"},
+                                    labels={"Posición": "Posición en el rango óptimo (%)"})
+                    fig_e.add_hrect(y0=0, y1=100, fillcolor="green", opacity=0.12, line_width=0,
+                                    annotation_text="Zona óptima", annotation_position="top left")
+                    fig_e.add_hline(y=0, line_dash="dot", line_color="#3366cc",
+                                    annotation_text="Mínimo", annotation_position="bottom right")
+                    fig_e.add_hline(y=100, line_dash="dot", line_color="#cc3333",
+                                    annotation_text="Máximo", annotation_position="top right")
+                    fig_e.update_traces(line_width=3, marker_size=10)
+                    st.plotly_chart(fig_e, width="stretch")
+                    st.caption("Dentro de la franja verde = óptimo para la etapa de esa fecha. Por encima = exceso; "
+                               "por debajo = falta. Pasa el mouse sobre los puntos para ver el valor real.")
+
+                # ----- Descargar informe -----
+                lineas = [f"EVOLUCIÓN - {lote_e} | {matriz_e}",
+                          f"Antes: {m0['Fecha']:%d/%m/%Y} ({m0['Etapa']})  ->  Ahora: {m1['Fecha']:%d/%m/%Y} ({m1['Etapa']})",
+                          f"Mejoraron: {n_mej} | Empeoraron: {n_emp} | Sin cambio: {n_igual}"]
+                if p0 is not None and p1 is not None:
+                    lineas.append(f"Parámetros en óptimo: {p0:.0f}% -> {p1:.0f}%")
+                lineas.append("")
+                lineas += [f"- {f.Parámetro}: {f.Resultado.split(' ', 1)[1]}. {f.Explicación}" for f in comp.itertuples()]
+                lineas += ["", "Análisis orientativo. Confirma las decisiones con tu agrónomo."]
+                st.download_button("📄 Descargar informe de evolución", "\n".join(lineas).encode("utf-8"),
+                                   file_name=f"evolucion_{lote_e}_{m1['Fecha']:%Y%m%d}.txt", mime="text/plain")
 
 COLORES_MATRIZ = {"Agua de Riego": "#4C78A8", "Solución de Suelo": "#9D755D", "Savia (ECP)": "#54A24B"}
 
