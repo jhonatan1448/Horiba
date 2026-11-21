@@ -35,17 +35,26 @@ PARAMETROS = {
     "NO3_ppm": ("Nitrato (NO3⁻) ppm", "Nitrato NO3⁻ (ppm)"),
     "K_ppm": ("Potasio (K⁺) ppm", "Potasio K⁺ (ppm)"),
     "Ca_ppm": ("Calcio (Ca²⁺) ppm", "Calcio Ca²⁺ (ppm)"),
-    "Na_ppm": (None, "Sodio Na⁺ (ppm)"),
+    "Na_ppm": ("Sodio (Na⁺) ppm", "Sodio Na⁺ (ppm)"),
 }
+
+# Iones para el gráfico de torta
+IONES = {"Ca_ppm": "Calcio (Ca²⁺)", "K_ppm": "Potasio (K⁺)", "Na_ppm": "Sodio (Na⁺)", "NO3_ppm": "Nitrato (NO3⁻)"}
+# Peso equivalente (g/eq) = masa molar / carga  ->  meq/L = ppm / peso equivalente
+PESO_EQUIVALENTE = {"Ca_ppm": 20.04, "K_ppm": 39.10, "Na_ppm": 22.99, "NO3_ppm": 62.00}
+COLORES_IONES = {"Calcio (Ca²⁺)": "#4C78A8", "Potasio (K⁺)": "#F58518",
+                 "Sodio (Na⁺)": "#E45756", "Nitrato (NO3⁻)": "#54A24B"}
 
 RANGOS_INICIALES = pd.DataFrame({
     "Matriz / Recurso": ["Agua de Riego", "Solución de Suelo", "Savia (ECP)", "Savia (ECP)", "Savia (ECP)"],
     "Etapa Fenológica": ["Todas", "Todas", "Inicial / Enraizamiento", "Vegetativa / Desarrollo", "Productiva / Llenado"],
     "pH Óptimo": ["5.5 - 6.5", "5.8 - 6.8", "5.4 - 6.0", "5.4 - 6.2", "5.6 - 6.2"],
-    "CE (dS/m)": ["< 1.0", "1.5 - 2.5", "-", "-", "-"],
-    "Nitrato (NO3⁻) ppm": ["10 - 50", "100 - 200", "1200 - 1500", "1000 - 1300", "700 - 900"],
-    "Potasio (K⁺) ppm": ["10 - 30", "150 - 250", "2000 - 2500", "2500 - 3500", "3500 - 5000"],
-    "Calcio (Ca²⁺) ppm": ["40 - 80", "100 - 180", "150 - 200", "150 - 250", "100 - 180"],
+    "CE (dS/m)": ["< 1.0", "1.5 - 2.5", "12 - 15", "12 - 15", "12 - 15"],
+    "Nitrato (NO3⁻) ppm": ["10 - 50", "100 - 200", "4000 - 5000", "3000 - 3500", "2500 - 3500"],
+    "Potasio (K⁺) ppm": ["10 - 30", "150 - 250", "2000 - 2500", "6000 - 8000", "3500 - 5000"],
+    "Calcio (Ca²⁺) ppm": ["40 - 80", "100 - 180", "1500 - 2000", "1000 - 1500", "1000 - 1500"],
+    # Sodio: se evalúa como máximo tolerable (no hay mínimo). Ajusta según tu criterio.
+    "Sodio (Na⁺) ppm": ["< 50", "< 100", "< 200", "< 200", "< 200"],
 })
 
 
@@ -80,7 +89,9 @@ def guardar_datos(df: pd.DataFrame) -> None:
 def cargar_rangos() -> pd.DataFrame:
     if RANGOS_FILE.exists():
         df = pd.read_csv(RANGOS_FILE, dtype=str).fillna("-")
-        if "Etapa Fenológica" in df.columns:
+        # Si el archivo guardado es de una versión anterior (sin columna de Sodio),
+        # se reemplaza por los nuevos valores por defecto.
+        if list(df.columns) == list(RANGOS_INICIALES.columns):
             return df
     RANGOS_INICIALES.to_csv(RANGOS_FILE, index=False)
     return RANGOS_INICIALES.copy()
@@ -284,11 +295,12 @@ with tab_graf:
         fmin, fmax = df_historico["Fecha"].min().date(), df_historico["Fecha"].max().date()
         rango_fechas = st.date_input("Periodo", (fmin, fmax), min_value=fmin, max_value=fmax, format="DD/MM/YYYY")
 
-        df_f = df_historico[(df_historico["Lote"].isin(lotes_sel)) &
-                            (df_historico["Matriz"] == matriz_sel)].dropna(subset=[parametro])
+        df_base = df_historico[(df_historico["Lote"].isin(lotes_sel)) &
+                               (df_historico["Matriz"] == matriz_sel)]
         if isinstance(rango_fechas, tuple) and len(rango_fechas) == 2:
-            df_f = df_f[df_f["Fecha"].dt.date.between(*rango_fechas)]
-        df_f = df_f.sort_values("Fecha")
+            df_base = df_base[df_base["Fecha"].dt.date.between(*rango_fechas)]
+        df_base = df_base.sort_values("Fecha")
+        df_f = df_base.dropna(subset=[parametro])
 
         if df_f.empty:
             st.warning("No hay datos para esa combinación de filtros.")
@@ -313,6 +325,52 @@ with tab_graf:
             k2.metric("Promedio", f"{df_f[parametro].mean():.2f}")
             k3.metric("Mínimo / Máximo", f"{df_f[parametro].min():.2f} / {df_f[parametro].max():.2f}")
             k4.metric("Estado del último", evaluar(ultimo, mn, mx))
+
+        # ---------- GRÁFICO DE TORTA: COMPOSICIÓN IÓNICA ----------
+        st.divider()
+        st.subheader("🥧 Composición iónica: Calcio, Potasio, Sodio y Nitratos")
+        st.caption("Usa los mismos filtros de lote, matriz y periodo de arriba.")
+
+        p1, p2, p3 = st.columns(3)
+        lote_torta = p1.selectbox("Lote", sorted(df_base["Lote"].unique()) or ["—"], key="lote_torta")
+        base_torta = p2.radio("Datos", ["Última muestra", "Promedio del periodo"], key="base_torta")
+        unidad = p3.radio("Unidad", ["ppm", "meq/L"], horizontal=True, key="unidad_torta",
+                          help="meq/L compara los iones por su carga química (más útil para el balance "
+                               "nutricional). ppm compara por peso.")
+
+        df_lote = df_base[df_base["Lote"] == lote_torta]
+        if df_lote.empty:
+            st.info("No hay muestras para ese lote con los filtros actuales.")
+        else:
+            if base_torta == "Última muestra":
+                fila = df_lote.iloc[-1]
+                titulo = f"{lote_torta} · {matriz_sel} · {fila['Fecha']:%d/%m/%Y}"
+            else:
+                fila = df_lote[list(IONES)].mean()
+                titulo = f"{lote_torta} · {matriz_sel} · promedio de {len(df_lote)} muestras"
+
+            datos_torta = pd.DataFrame([
+                {"Ion": nombre,
+                 "Valor": fila[col] / (PESO_EQUIVALENTE[col] if unidad == "meq/L" else 1)}
+                for col, nombre in IONES.items() if pd.notna(fila[col]) and fila[col] > 0
+            ])
+            if datos_torta.empty:
+                st.info("Esa muestra no tiene valores de Ca, K, Na ni NO3.")
+            else:
+                fig_torta = px.pie(datos_torta, names="Ion", values="Valor", hole=0.35,
+                                   title=titulo, color="Ion", color_discrete_map=COLORES_IONES)
+                fig_torta.update_traces(textinfo="percent+label",
+                                        hovertemplate=f"%{{label}}: %{{value:.2f}} {unidad}<extra></extra>")
+                t1, t2 = st.columns([2, 1])
+                t1.plotly_chart(fig_torta, width="stretch")
+                t2.dataframe(datos_torta.assign(**{"%": 100 * datos_torta["Valor"] / datos_torta["Valor"].sum()})
+                             .rename(columns={"Valor": unidad}),
+                             hide_index=True, width="stretch",
+                             column_config={unidad: st.column_config.NumberColumn(format="%.2f"),
+                                            "%": st.column_config.NumberColumn(format="%.1f")})
+                faltan = [n for c, n in IONES.items() if pd.isna(fila[c]) or fila[c] <= 0]
+                if faltan:
+                    t2.caption("Sin dato: " + ", ".join(faltan))
 
 # ==========================================
 # PESTAÑA 3: HISTÓRICO EDITABLE
