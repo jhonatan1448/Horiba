@@ -168,6 +168,248 @@ def a_excel(hojas: dict) -> bytes:
 
 
 # ==========================================
+# MOTOR DE INTERPRETACIÓN (lenguaje sencillo)
+# ==========================================
+# MENSAJES[parámetro][grupo de matriz][estado] = (qué significa, qué hacer)
+# grupo: "agua", "suelo", "savia". Estado: "Bajo" / "Alto".
+MENSAJES = {
+    "pH": {
+        "agua": {
+            "Bajo": ("El agua está más ácida de lo recomendado.",
+                     "Revisa la dosis de ácido si estás acidificando el agua; puede corroer equipos y goteros."),
+            "Alto": ("El agua está alcalina. Probablemente tiene bicarbonatos, que bloquean hierro, fósforo, "
+                     "manganeso y zinc y tapan goteros.",
+                     "Considera acidificar el agua de riego (ácido nítrico o fosfórico) para bajar el pH al rango óptimo."),
+        },
+        "suelo": {
+            "Bajo": ("El suelo está ácido: el calcio y el magnesio se aprovechan peor y puede haber toxicidad "
+                     "por manganeso o aluminio.",
+                     "Revisa si estás usando muchas fuentes de amonio o ácidos; evalúa una enmienda (cal) con tu agrónomo."),
+            "Alto": ("El suelo está alcalino: hierro, manganeso, zinc y fósforo se bloquean y la planta puede "
+                     "mostrar hojas nuevas amarillas.",
+                     "Acidifica el agua de riego y usa fertilizantes de reacción ácida; vigila los micronutrientes."),
+        },
+        "savia": {
+            "Bajo": ("La savia está más ácida de lo normal. Suele asociarse a falta de cationes (potasio, calcio, "
+                     "magnesio) o a exceso de amonio, y a mayor sensibilidad a hongos.",
+                     "Revisa el aporte de K, Ca y Mg y reduce las fuentes amoniacales si las usas."),
+            "Alto": ("La savia está menos ácida de lo normal. Puede indicar exceso de cationes o estrés de la planta.",
+                     "Revisa si hay exceso de potasio o calcio en la fertilización y el estado hídrico del cultivo."),
+        },
+    },
+    "EC_dS_m": {
+        "agua": {
+            "Alto": ("El agua trae muchas sales. Eso suma salinidad al suelo en cada riego.",
+                     "Aplica riegos con fracción de lavado (drenaje), y descuenta las sales del agua al calcular la fertilización."),
+            "Bajo": ("El agua tiene muy pocas sales (es un agua 'blanda').",
+                     "Normalmente no es problema; asegúrate de aportar calcio y magnesio con la fertilización."),
+        },
+        "suelo": {
+            "Alto": ("Hay demasiadas sales en la zona de raíces. La planta absorbe agua con dificultad; en tomate "
+                     "aumenta el riesgo de pudrición apical y frutos pequeños.",
+                     "Aumenta el volumen o la frecuencia de riego para lavar sales y reduce la concentración de la fertirrigación."),
+            "Bajo": ("Hay pocos nutrientes disponibles en la zona de raíces.",
+                     "Aumenta la concentración de la fertirrigación o revisa si estás regando en exceso (lavando nutrientes)."),
+        },
+        "savia": {
+            "Alto": ("La savia está muy concentrada. Puede indicar estrés hídrico o exceso de fertilización.",
+                     "Revisa la humedad del suelo, el riego en horas de calor y la CE de la solución de suelo."),
+            "Bajo": ("La savia está diluida: la planta tiene pocos solutos o está muy hidratada.",
+                     "Revisa si hay exceso de riego o una nutrición general baja."),
+        },
+    },
+    "NO3_ppm": {
+        "agua": {
+            "Alto": ("El agua ya trae nitrógeno (nitratos).", "Descuenta ese nitrógeno del plan de fertilización para no sobrefertilizar."),
+            "Bajo": ("El agua trae poco nitrato. Es lo normal.", "Ninguna acción necesaria."),
+        },
+        "suelo": {
+            "Alto": ("Hay exceso de nitrógeno disponible en el suelo.", "Reduce el nitrógeno en la fertirrigación y vigila la salinidad."),
+            "Bajo": ("Hay poco nitrógeno disponible para las raíces.", "Aumenta el aporte de nitrógeno nítrico en la fertirrigación."),
+        },
+        "savia": {
+            "Alto": ("La planta tiene exceso de nitrógeno: crece mucho en hojas y tallos, se vuelve más tierna "
+                     "(más plagas y enfermedades) y puede retrasar el cuajado y la maduración.",
+                     "Reduce el nitrógeno en la fertirrigación, sobre todo si el cultivo está en etapa productiva."),
+            "Bajo": ("La planta tiene poco nitrógeno. Puede verse amarillamiento general de las hojas viejas "
+                     "y crecimiento lento.",
+                     "Aumenta el aporte de nitrógeno (preferiblemente nítrico) y vuelve a medir en 1 semana."),
+        },
+    },
+    "K_ppm": {
+        "agua": {
+            "Alto": ("El agua trae potasio.", "Descuéntalo del plan de fertilización."),
+            "Bajo": ("El agua trae poco potasio. Es lo normal.", "Ninguna acción necesaria."),
+        },
+        "suelo": {
+            "Alto": ("Hay exceso de potasio en el suelo; compite con la absorción de calcio y magnesio.",
+                     "Reduce el potasio en la fertirrigación y vigila calcio y magnesio."),
+            "Bajo": ("Hay poco potasio disponible para las raíces.", "Aumenta el aporte de potasio en la fertirrigación."),
+        },
+        "savia": {
+            "Alto": ("La planta tiene exceso de potasio. Compite con el calcio y el magnesio, y puede inducir "
+                     "deficiencia de magnesio o pudrición apical.",
+                     "Reduce el potasio y revisa el equilibrio con calcio y magnesio."),
+            "Bajo": ("La planta tiene poco potasio. En tomate afecta el color, el sabor (grados Brix), el "
+                     "tamaño del fruto y la maduración uniforme.",
+                     "Aumenta el aporte de potasio, especialmente desde el inicio del llenado de frutos."),
+        },
+    },
+    "Ca_ppm": {
+        "agua": {
+            "Alto": ("El agua es dura (tiene mucho calcio); puede formar incrustaciones en goteros.",
+                     "Descuenta ese calcio de la fertilización y considera acidificar para evitar taponamientos."),
+            "Bajo": ("El agua trae poco calcio.", "Asegúrate de aportar calcio con la fertilización."),
+        },
+        "suelo": {
+            "Alto": ("Hay exceso de calcio en el suelo; puede limitar la absorción de potasio y magnesio.",
+                     "Reduce las fuentes de calcio y vigila potasio y magnesio."),
+            "Bajo": ("Hay poco calcio disponible para las raíces.", "Aumenta el aporte de calcio (por ejemplo, nitrato de calcio)."),
+        },
+        "savia": {
+            "Alto": ("La planta tiene calcio de sobra; puede competir con potasio y magnesio.",
+                     "Revisa si se puede reducir el calcio y vigila los niveles de K y Mg."),
+            "Bajo": ("La planta tiene poco calcio. En tomate es la causa principal de la pudrición apical "
+                     "(mancha negra en la punta del fruto).",
+                     "Aumenta el calcio, mantén riegos regulares (sin secar el suelo), evita la CE alta y la humedad "
+                     "relativa muy alta; considera aplicaciones foliares de calcio."),
+        },
+    },
+    "Na_ppm": {
+        "agua": {
+            "Alto": ("El agua trae mucho sodio. Con el tiempo daña la estructura del suelo y desplaza al potasio y al calcio.",
+                     "Busca otra fuente de agua o mézclala; aplica riegos de lavado y aporta calcio."),
+        },
+        "suelo": {
+            "Alto": ("Se está acumulando sodio en el suelo; aumenta la salinidad y compite con potasio y calcio.",
+                     "Aplica riegos de lavado con buen drenaje, aporta calcio y evita fertilizantes con sodio."),
+        },
+        "savia": {
+            "Alto": ("La planta está absorbiendo mucho sodio, lo que indica estrés salino y desplaza al potasio.",
+                     "Revisa el sodio del agua y del suelo, haz riegos de lavado y refuerza el potasio y el calcio."),
+        },
+    },
+}
+
+NOMBRE_CORTO = {"pH": "pH", "EC_dS_m": "CE", "NO3_ppm": "Nitrato", "K_ppm": "Potasio",
+                "Ca_ppm": "Calcio", "Na_ppm": "Sodio"}
+
+
+def grupo_matriz(matriz: str) -> str:
+    return {"Agua de Riego": "agua", "Solución de Suelo": "suelo"}.get(matriz, "savia")
+
+
+def intensidad(valor, mn, mx) -> str:
+    """'ligeramente' si está a menos del 15 % del límite; 'muy' si se pasa más del 50 %."""
+    limite = mn if (mn is not None and valor < mn) else mx
+    if not limite:
+        return ""
+    desvio = abs(valor - limite) / limite
+    return "ligeramente " if desvio < 0.15 else ("muy " if desvio > 0.5 else "")
+
+
+def interpretar(muestra: pd.Series, df_rangos: pd.DataFrame, df_hist: pd.DataFrame) -> dict:
+    """Devuelve un resumen + lista de hallazgos con significado y acción en lenguaje sencillo."""
+    grupo = grupo_matriz(muestra["Matriz"])
+    hallazgos, optimos, sin_rango = [], [], []
+
+    for param in PARAMETROS:
+        valor = muestra.get(param)
+        if valor is None or pd.isna(valor):
+            continue
+        mn, mx = buscar_rango(df_rangos, muestra["Matriz"], muestra["Etapa"], param)
+        estado = evaluar(valor, mn, mx)
+        nombre = NOMBRE_CORTO[param]
+        if "Óptimo" in estado:
+            optimos.append(nombre)
+        elif "Sin rango" in estado:
+            sin_rango.append(nombre)
+        else:
+            clave = "Bajo" if "Bajo" in estado else "Alto"
+            texto = MENSAJES.get(param, {}).get(grupo, {}).get(clave)
+            significado, accion = texto if texto else ("Valor fuera del rango de referencia.", "Revísalo con tu agrónomo.")
+            ref = f"< {mx:g}" if mn is None else (f"> {mn:g}" if mx is None else f"{mn:g} - {mx:g}")
+            hallazgos.append({
+                "nivel": "error" if intensidad(valor, mn, mx) != "ligeramente " else "warning",
+                "titulo": f"{nombre} {intensidad(valor, mn, mx)}{clave.lower()} ({valor:g} · óptimo {ref})",
+                "significado": significado, "accion": accion})
+
+    # --- Relaciones entre nutrientes (en savia) ---
+    if grupo == "savia":
+        k, ca = muestra.get("K_ppm"), muestra.get("Ca_ppm")
+        mn_k, mx_k = buscar_rango(df_rangos, muestra["Matriz"], muestra["Etapa"], "K_ppm")
+        mn_ca, mx_ca = buscar_rango(df_rangos, muestra["Matriz"], muestra["Etapa"], "Ca_ppm")
+        if all(v is not None and pd.notna(v) for v in [k, ca]) and ca > 0 and None not in [mn_k, mx_k, mn_ca, mx_ca]:
+            rel = k / ca
+            rel_ref = ((mn_k + mx_k) / 2) / ((mn_ca + mx_ca) / 2)   # relación esperada según TUS rangos
+            if rel > rel_ref * 1.5:
+                hallazgos.append({
+                    "nivel": "warning",
+                    "titulo": f"Desbalance K/Ca: {rel:.1f} (esperado ≈ {rel_ref:.1f})",
+                    "significado": "Hay mucho potasio en proporción al calcio. Incluso si cada uno estuviera en rango, "
+                                   "esta relación aumenta el riesgo de pudrición apical.",
+                    "accion": "Equilibra la fertilización: menos potasio o más calcio."})
+            elif rel < rel_ref / 1.5:
+                hallazgos.append({
+                    "nivel": "warning",
+                    "titulo": f"Desbalance K/Ca: {rel:.1f} (esperado ≈ {rel_ref:.1f})",
+                    "significado": "Hay poco potasio en proporción al calcio; puede afectar la calidad y el llenado del fruto.",
+                    "accion": "Equilibra la fertilización: más potasio o menos calcio."})
+            # Riesgo de magnesio (indicador indirecto: no mide Mg)
+            if k > mx_k or rel > rel_ref * 1.5:
+                hallazgos.append({
+                    "nivel": "info",
+                    "titulo": "Posible riesgo de deficiencia de magnesio",
+                    "significado": "El exceso de potasio compite con el magnesio. Este equipo no mide Mg, "
+                                   "así que esto es solo una alerta, no un diagnóstico.",
+                    "accion": "Revisa las hojas viejas (amarillamiento entre nervaduras) y confirma con un análisis de Mg."})
+
+    # --- Comparación con la muestra anterior del mismo lote y matriz ---
+    cambios = []
+    prev = df_hist[(df_hist["Lote"] == muestra["Lote"]) & (df_hist["Matriz"] == muestra["Matriz"]) &
+                   (df_hist["Fecha"] < pd.Timestamp(muestra["Fecha"]))].sort_values("Fecha")
+    if not prev.empty:
+        anterior = prev.iloc[-1]
+        for param in PARAMETROS:
+            a, b = anterior.get(param), muestra.get(param)
+            if pd.notna(a) and pd.notna(b) and a not in (0, None):
+                var = (b - a) / a
+                if abs(var) >= 0.20:
+                    flecha = "⬆️ subió" if var > 0 else "⬇️ bajó"
+                    cambios.append(f"{NOMBRE_CORTO[param]} {flecha} {abs(var):.0%} (de {a:g} a {b:g})")
+        fecha_anterior = anterior["Fecha"]
+    else:
+        fecha_anterior = None
+
+    n_prob = sum(1 for h in hallazgos if h["nivel"] in ("error", "warning"))
+    if n_prob == 0:
+        resumen = ("success", "✅ Muestra en buen estado: todos los parámetros con rango están dentro del óptimo.")
+    elif n_prob <= 2:
+        resumen = ("warning", f"⚠️ Atención: {n_prob} punto(s) requieren ajuste. Revisa las recomendaciones.")
+    else:
+        resumen = ("error", f"🚨 {n_prob} puntos fuera de lo recomendado. Conviene corregir la fertirrigación pronto.")
+
+    return {"resumen": resumen, "hallazgos": hallazgos, "optimos": optimos, "sin_rango": sin_rango,
+            "cambios": cambios, "fecha_anterior": fecha_anterior}
+
+
+def informe_texto(muestra: pd.Series, analisis: dict) -> str:
+    """Versión en texto plano para descargar o enviar por WhatsApp/correo."""
+    lineas = [f"INFORME HORIBA - {muestra['Lote']} | {muestra['Matriz']} | {muestra['Etapa']} | "
+              f"{pd.Timestamp(muestra['Fecha']):%d/%m/%Y}", "", analisis["resumen"][1], ""]
+    if analisis["optimos"]:
+        lineas.append("En rango óptimo: " + ", ".join(analisis["optimos"]))
+    for h in analisis["hallazgos"]:
+        lineas += ["", f"* {h['titulo']}", f"  Qué significa: {h['significado']}", f"  Qué hacer: {h['accion']}"]
+    if analisis["cambios"]:
+        lineas += ["", f"Cambios desde el {analisis['fecha_anterior']:%d/%m/%Y}:"] + [f"  - {c}" for c in analisis["cambios"]]
+    if muestra.get("Notas"):
+        lineas += ["", f"Notas: {muestra['Notas']}"]
+    lineas += ["", "Análisis orientativo generado automáticamente. Confirma las decisiones con tu agrónomo."]
+    return "\n".join(lineas)
+
+
+# ==========================================
 # ESTADO
 # ==========================================
 df_historico = cargar_datos()
@@ -176,6 +418,43 @@ df_rangos = cargar_rangos()
 # Mensajes que sobreviven a st.rerun()
 if "aviso" in st.session_state:
     st.toast(st.session_state.pop("aviso"))
+
+
+def mostrar_analisis(muestra: pd.Series, clave: str) -> None:
+    """Dibuja el análisis interpretado de una muestra."""
+    analisis = interpretar(muestra, df_rangos, df_historico)
+    st.subheader(f"🧠 Análisis: {muestra['Lote']} · {muestra['Matriz']} · {muestra['Etapa']} · "
+                 f"{pd.Timestamp(muestra['Fecha']):%d/%m/%Y}")
+    tipo, texto = analisis["resumen"]
+    getattr(st, tipo)(texto)
+
+    if analisis["optimos"]:
+        st.markdown("🟢 **En rango óptimo:** " + ", ".join(analisis["optimos"]))
+
+    iconos = {"error": "🔴", "warning": "🟠", "info": "🔵"}
+    for h in analisis["hallazgos"]:
+        with st.container(border=True):
+            st.markdown(f"**{iconos[h['nivel']]} {h['titulo']}**")
+            st.markdown(f"**¿Qué significa?** {h['significado']}")
+            st.markdown(f"**¿Qué hacer?** {h['accion']}")
+
+    if analisis["cambios"]:
+        st.markdown(f"**📅 Cambios importantes desde el muestreo del {analisis['fecha_anterior']:%d/%m/%Y}:**")
+        for c in analisis["cambios"]:
+            st.markdown(f"- {c}")
+    if analisis["sin_rango"]:
+        st.caption("Sin rango de referencia para: " + ", ".join(analisis["sin_rango"]) +
+                   ". Puedes agregarlo en la pestaña Rangos.")
+
+    with st.expander("Ver tabla de valores"):
+        st.dataframe(tabla_diagnostico(muestra, df_rangos), hide_index=True, width="stretch",
+                     column_config={"Medido": st.column_config.NumberColumn(format="%.2f")})
+
+    st.download_button("📄 Descargar informe (texto)", data=informe_texto(muestra, analisis).encode("utf-8"),
+                       file_name=f"informe_{muestra['Lote']}_{pd.Timestamp(muestra['Fecha']):%Y%m%d}.txt",
+                       mime="text/plain", key=f"dl_{clave}")
+    st.caption("ℹ️ Análisis orientativo generado automáticamente a partir de tus rangos de referencia. "
+               "Confirma las decisiones de fertilización con tu agrónomo.")
 
 # ==========================================
 # BARRA LATERAL: respaldo de datos
@@ -215,8 +494,8 @@ with st.sidebar:
 st.title("🌱 Sistema de Análisis y Registro - HORIBA LAQUAtwin")
 st.write("Registra y analiza los parámetros químicos de Agua, Suelo y Savia por etapas fenológicas.")
 
-tab_ingreso, tab_graf, tab_hist, tab_rangos = st.tabs(
-    ["📥 Nuevo ingreso", "📊 Gráficos de tendencia", "📋 Histórico", "🔬 Rangos de referencia"])
+tab_ingreso, tab_analisis, tab_graf, tab_hist, tab_rangos = st.tabs(
+    ["📥 Nuevo ingreso", "🧠 Análisis", "📊 Gráficos de tendencia", "📋 Histórico", "🔬 Rangos de referencia"])
 
 # ==========================================
 # PESTAÑA 1: INGRESO DE DATOS
@@ -262,18 +541,28 @@ with tab_ingreso:
             st.session_state["aviso"] = f"✅ Muestra guardada en {lote.strip()}"
             st.rerun()
 
-    # Diagnóstico inmediato de la última muestra guardada
+    # Análisis inmediato de la última muestra guardada
     if "ultima_muestra" in st.session_state:
-        muestra = pd.Series(st.session_state["ultima_muestra"])
-        st.subheader(f"🩺 Diagnóstico: {muestra['Lote']} · {muestra['Matriz']} · {muestra['Etapa']}")
-        diag = tabla_diagnostico(muestra, df_rangos)
-        st.dataframe(diag, hide_index=True, width="stretch",
-                     column_config={"Medido": st.column_config.NumberColumn(format="%.2f")})
-        fuera = diag[diag["Estado"].str.contains("Alto|Bajo")]
-        if fuera.empty:
-            st.success("Todos los parámetros con rango definido están en el óptimo.")
-        else:
-            st.warning("Fuera de rango: " + ", ".join(f"{r.Parámetro} ({r.Estado[2:]})" for r in fuera.itertuples()))
+        st.divider()
+        mostrar_analisis(pd.Series(st.session_state["ultima_muestra"]), "ingreso")
+
+# ==========================================
+# PESTAÑA: ANÁLISIS DE CUALQUIER MUESTRA
+# ==========================================
+with tab_analisis:
+    st.header("🧠 Análisis e interpretación")
+    if df_historico.empty:
+        st.info("Aún no hay muestras registradas.")
+    else:
+        a1, a2, a3 = st.columns(3)
+        lote_a = a1.selectbox("Lote", sorted(df_historico["Lote"].unique()), key="lote_a")
+        df_la = df_historico[df_historico["Lote"] == lote_a]
+        matriz_a = a2.selectbox("Matriz", sorted(df_la["Matriz"].unique()), key="matriz_a")
+        df_lm = df_la[df_la["Matriz"] == matriz_a].sort_values("Fecha", ascending=False)
+        idx = a3.selectbox("Muestra", df_lm.index,
+                           format_func=lambda i: f"{df_lm.loc[i, 'Fecha']:%d/%m/%Y} · {df_lm.loc[i, 'Etapa']}",
+                           key="muestra_a")
+        mostrar_analisis(df_lm.loc[idx], "tab")
 
 # ==========================================
 # PESTAÑA 2: GRÁFICOS
